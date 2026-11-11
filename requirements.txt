@@ -1,0 +1,17 @@
+# Runtime dependencies for the proxy service.
+#
+# Version ranges are intentionally wide because proxy.py only relies on the
+# stable parts of the Anthropic SDK (Anthropic(), messages.create(),
+# messages.with_streaming_response.create()). The HTTP client is created through
+# anthropic.DefaultHttpxClient so the SDK stays bound to the HTTP library it
+# expects (httpx for the 0.4x line, httpx2 for 1.x/2.x).
+#
+# Verified against:
+#   anthropic 0.49.0 (httpx 0.28.1) and anthropic 2.6.0 (httpx2 2.16.0)
+
+fastapi>=0.111,<1.0
+uvicorn[standard]>=0.30,<1.0
+anthropic>=0.40,<3.0
+
+# Only needed by task/environment/test_harness.py (offline 503 reproduction).
+httpx>=0.27,<1.0
