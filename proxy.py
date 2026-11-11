@@ -169,8 +169,11 @@ def _content_blocks(content) -> list:
 
 def _tool_use_blocks(message: dict) -> list:
     """Convert OpenAI assistant tool_calls into Anthropic tool_use blocks."""
+    calls = list(message.get("tool_calls") or [])
+    if not calls and isinstance(message.get("function_call"), dict):
+        calls = [{"function": message["function_call"]}]
     blocks = []
-    for call in message.get("tool_calls") or []:
+    for call in calls:
         if not isinstance(call, dict):
             continue
         fn = call.get("function") or {}
@@ -198,17 +201,32 @@ def _tool_use_blocks(message: dict) -> list:
 
 def _tool_result_block(message: dict) -> dict:
     content = message.get("content")
+    if isinstance(content, str):
+        return {
+            "type": "tool_result",
+            "tool_use_id": message.get("tool_call_id", ""),
+            "content": content,
+        }
+    blocks = []
     if isinstance(content, list):
-        text = "\n".join(
-            part.get("text", "") for part in content
-            if isinstance(part, dict) and part.get("type") in ("text", "input_text")
-        )
-    else:
-        text = "" if content is None else str(content)
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            ptype = part.get("type")
+            if ptype in ("text", "input_text"):
+                text = part.get("text", "")
+                if text:
+                    blocks.append({"type": "text", "text": text})
+            elif ptype in ("image_url", "input_image"):
+                image = _image_part(part)
+                if image:
+                    blocks.append(image)
+    elif content:
+        blocks.append({"type": "text", "text": str(content)})
     return {
         "type": "tool_result",
         "tool_use_id": message.get("tool_call_id", ""),
-        "content": text,
+        "content": blocks,
     }
 
 
@@ -233,9 +251,12 @@ def _convert_tools(tools) -> list:
         name = fn.get("name")
         if not name:
             continue
+        schema = fn.get("parameters") or fn.get("input_schema")
+        if not isinstance(schema, dict) or not schema:
+            schema = {"type": "object", "properties": {}}
         item = {
             "name": name,
-            "input_schema": fn.get("parameters") or {"type": "object", "properties": {}},
+            "input_schema": schema,
         }
         if fn.get("description"):
             item["description"] = fn["description"]
@@ -252,8 +273,8 @@ def _convert_tool_choice(choice) -> dict | None:
         return None
     if isinstance(choice, dict):
         ctype = choice.get("type")
-        if ctype == "function":
-            name = (choice.get("function") or {}).get("name")
+        if ctype in ("function", "tool"):
+            name = (choice.get("function") or {}).get("name") or choice.get("name")
             if name:
                 return {"type": "tool", "name": name}
         elif ctype in ("auto", "any"):
@@ -305,6 +326,12 @@ def _openai_to_anthropic(body: dict) -> dict:
                 messages[-1]["content"].append(block)
             else:
                 messages.append({"role": "user", "content": [block]})
+            continue
+
+        if role == "function":
+            name = msg.get("name", "function")
+            text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+            messages.append({"role": "user", "content": [{"type": "text", "text": f"[{name} result] {text}"}]})
             continue
 
         if role == "assistant":
