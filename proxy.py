@@ -24,6 +24,8 @@ import os
 import time
 import uuid
 import threading
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -72,6 +74,7 @@ CHUNK_TIMEOUT      = _env_float("PROXY_CHUNK_TIMEOUT", 120.0)
 CALL_WORKERS       = max(1, _env_int("PROXY_CALL_WORKERS", 16))
 STREAM_WORKERS     = max(1, _env_int("PROXY_STREAM_WORKERS", 32))
 STREAM_ERROR_STATUS = _env_bool("PROXY_STREAM_ERROR_STATUS", False)
+RESPONSES_MODE     = _env_str("PROXY_RESPONSES_MODE", "auto").lower()  # auto | always | off
 
 _TIMEOUT = anthropic.Timeout(
     connect=CONNECT_TIMEOUT,
@@ -373,6 +376,332 @@ def _openai_to_anthropic(body: dict) -> dict:
         kw["metadata"] = {"user_id": str(body["user"])}
 
     return kw
+
+
+# ── AgentRouter Responses API adapter ────────────────────────────────────────
+#
+# AgentRouter rejects function tools on /v1/chat/completions for some models
+# ("Function tools with reasoning_effort are not supported ... use /v1/responses")
+# and mangles image blocks on the chat path. The Responses API accepts both, so
+# tool and image requests are routed there and translated back.
+
+_RESPONSES_HEADERS = {
+    "content-type": "application/json",
+    "anthropic-version": "2023-06-01",
+    "User-Agent": "Anthropic/Python 0.49.0",
+    "x-stainless-lang": "python",
+    "x-stainless-package-version": "0.49.0",
+    "x-stainless-runtime": "CPython",
+}
+
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+class _ResponsesError(Exception):
+    def __init__(self, status: int, message: str, fallback: bool = False):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+        self.fallback = fallback
+
+
+def _responses_text(content) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    return "\n".join(
+        part.get("text", "") for part in content
+        if isinstance(part, dict) and part.get("type") in ("text", "input_text", "output_text")
+    )
+
+
+def _responses_content(content) -> list:
+    if isinstance(content, str):
+        return [{"type": "input_text", "text": content}] if content else []
+    parts = []
+    for part in content or []:
+        if not isinstance(part, dict):
+            continue
+        part_type = part.get("type")
+        if part_type in ("text", "input_text"):
+            text = part.get("text", "")
+            if text:
+                parts.append({"type": "input_text", "text": text})
+        elif part_type in ("image_url", "input_image"):
+            image = part.get("image_url")
+            url = image.get("url", "") if isinstance(image, dict) else (image or "")
+            if url:
+                item = {"type": "input_image", "image_url": url}
+                detail = image.get("detail") if isinstance(image, dict) else None
+                if detail in ("low", "high", "auto", "original"):
+                    item["detail"] = detail
+                parts.append(item)
+    return parts
+
+
+def _convert_responses_tools(tools) -> list:
+    converted = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        name = fn.get("name")
+        if not name:
+            continue
+        item = {
+            "type": "function",
+            "name": name,
+            "parameters": fn.get("parameters") or fn.get("input_schema") or {"type": "object", "properties": {}},
+        }
+        if fn.get("description"):
+            item["description"] = fn["description"]
+        converted.append(item)
+    return converted
+
+
+def _convert_responses_tool_choice(choice):
+    if choice is None:
+        return None
+    if isinstance(choice, str):
+        return choice if choice in ("auto", "required", "none") else None
+    if isinstance(choice, dict):
+        if choice.get("type") == "function":
+            name = (choice.get("function") or {}).get("name") or choice.get("name")
+            if name:
+                return {"type": "function", "name": name}
+        if choice.get("type") in ("auto", "required", "none"):
+            return choice["type"]
+    return None
+
+
+def _needs_responses(body: dict) -> bool:
+    if body.get("tools"):
+        return True
+    if body.get("tool_choice") not in (None, "none"):
+        return True
+    for message in body.get("messages", []):
+        if message.get("role") in ("tool", "function"):
+            return True
+        content = message.get("content")
+        if isinstance(content, list) and any(
+            isinstance(part, dict) and part.get("type") in ("image_url", "input_image") for part in content
+        ):
+            return True
+    return False
+
+
+def _openai_to_responses(body: dict) -> dict:
+    model = body.get("model", "gpt-6.1-sol")
+    if "/" in model:
+        model = model.split("/", 1)[1]
+
+    max_tokens = body.get("max_tokens") or body.get("max_completion_tokens") or 4096
+    instructions = []
+    items = []
+
+    for message in body.get("messages", []):
+        role = message.get("role", "user")
+        content = message.get("content")
+
+        if role in ("system", "developer"):
+            text = _responses_text(content)
+            if text:
+                instructions.append(text)
+            continue
+
+        if role in ("tool", "function"):
+            items.append({
+                "type": "function_call_output",
+                "call_id": message.get("tool_call_id") or message.get("name") or "",
+                "output": _responses_text(content),
+            })
+            continue
+
+        if role == "assistant":
+            text = _responses_text(content)
+            if text:
+                items.append({"role": "assistant", "content": [{"type": "output_text", "text": text}]})
+            calls = list(message.get("tool_calls") or [])
+            if not calls and isinstance(message.get("function_call"), dict):
+                calls = [{"function": message["function_call"]}]
+            for call in calls:
+                fn = call.get("function") or {}
+                name = fn.get("name")
+                if not name:
+                    continue
+                items.append({
+                    "type": "function_call",
+                    "call_id": call.get("id") or f"call_{uuid.uuid4().hex[:16]}",
+                    "name": name,
+                    "arguments": fn.get("arguments") or "{}",
+                })
+            continue
+
+        parts = _responses_content(content)
+        if parts:
+            items.append({"role": "user", "content": parts})
+
+    payload = {
+        "model": model,
+        "input": items or "hi",
+        "max_output_tokens": max_tokens,
+    }
+    if instructions:
+        payload["instructions"] = "\n\n".join(instructions)
+    if "temperature" in body:
+        payload["temperature"] = body["temperature"]
+    if "top_p" in body:
+        payload["top_p"] = body["top_p"]
+
+    tools = _convert_responses_tools(body.get("tools"))
+    if tools and body.get("tool_choice") != "none":
+        payload["tools"] = tools
+        choice = _convert_responses_tool_choice(body.get("tool_choice"))
+        if choice:
+            payload["tool_choice"] = choice
+
+    return payload
+
+
+def _responses_to_openai(data: dict) -> dict:
+    text_parts = []
+    tool_calls = []
+    for item in data.get("output", []) or []:
+        item_type = item.get("type")
+        if item_type == "message":
+            for part in item.get("content", []) or []:
+                if part.get("type") in ("output_text", "text"):
+                    text_parts.append(part.get("text", ""))
+        elif item_type == "function_call":
+            tool_calls.append({
+                "id": item.get("call_id") or item.get("id"),
+                "type": "function",
+                "function": {"name": item.get("name", ""), "arguments": item.get("arguments") or "{}"},
+            })
+
+    if tool_calls:
+        finish_reason = "tool_calls"
+    elif data.get("status") == "incomplete":
+        finish_reason = "length"
+    else:
+        finish_reason = "stop"
+
+    message = {"role": "assistant", "content": "".join(text_parts) or None}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+
+    usage = data.get("usage") or {}
+    return {
+        "id": f"chatcmpl-{data.get('id', uuid.uuid4().hex)}",
+        "object": "chat.completion",
+        "created": data.get("created_at") or int(time.time()),
+        "model": data.get("model", ""),
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+        "usage": {
+            "prompt_tokens": usage.get("input_tokens", 0),
+            "completion_tokens": usage.get("output_tokens", 0),
+            "total_tokens": usage.get("total_tokens", 0),
+        },
+    }
+
+
+def _responses_request(payload: dict, api_key: str):
+    data = json.dumps(payload).encode()
+    request = urllib.request.Request(TARGET + "/v1/responses", data=data, method="POST")
+    headers = dict(_RESPONSES_HEADERS)
+    headers["x-api-key"] = api_key
+    headers["accept"] = "text/event-stream" if payload.get("stream") else "application/json"
+    for key, value in headers.items():
+        request.add_header(key, value)
+    try:
+        return _OPENER.open(request, timeout=READ_TIMEOUT)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")
+        fallback = exc.code in (400, 404, 405) and any(
+            marker in detail.lower()
+            for marker in ("not supported", "does not support", "unknown", "invalid url", "not found")
+        )
+        raise _ResponsesError(exc.code, detail[:800], fallback=fallback) from None
+    except Exception as exc:
+        raise _ResponsesError(502, str(exc)) from None
+
+
+def _responses_call(payload: dict, api_key: str) -> dict:
+    with _responses_request(payload, api_key) as response:
+        raw = response.read().decode("utf-8", "replace")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        raise _ResponsesError(502, raw[:400]) from None
+
+
+def _responses_stream(payload: dict, api_key: str, model: str):
+    cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created = int(time.time())
+
+    def chunk(delta: dict, finish_reason=None) -> bytes:
+        body = {
+            "id": cmpl_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+        return f"data: {json.dumps(body)}\n\n".encode()
+
+    yield chunk({"role": "assistant"})
+
+    tool_indices: dict[int, int] = {}
+    next_tool_index = 0
+    saw_tool = False
+
+    try:
+        with _responses_request(payload, api_key) as response:
+            for raw_line in response:
+                line = raw_line.decode("utf-8", "replace").strip()
+                if not line.startswith("data: "):
+                    continue
+                try:
+                    event = json.loads(line[6:])
+                except json.JSONDecodeError:
+                    continue
+                event_type = event.get("type")
+                if event_type == "response.output_item.added":
+                    item = event.get("item") or {}
+                    if item.get("type") == "function_call":
+                        block_index = event.get("output_index", 0)
+                        tool_indices[block_index] = next_tool_index
+                        saw_tool = True
+                        yield chunk({"tool_calls": [{
+                            "index": next_tool_index,
+                            "id": item.get("call_id") or item.get("id"),
+                            "type": "function",
+                            "function": {"name": item.get("name", ""), "arguments": ""},
+                        }]})
+                        next_tool_index += 1
+                elif event_type == "response.function_call_arguments.delta":
+                    delta = event.get("delta", "")
+                    tool_index = tool_indices.get(event.get("output_index", 0))
+                    if delta and tool_index is not None:
+                        yield chunk({"tool_calls": [{"index": tool_index, "function": {"arguments": delta}}]})
+                elif event_type == "response.output_text.delta":
+                    delta = event.get("delta", "")
+                    if delta:
+                        yield chunk({"content": delta})
+                elif event_type in ("response.completed", "response.incomplete"):
+                    finish_reason = "tool_calls" if saw_tool else ("length" if event_type == "response.incomplete" else "stop")
+                    yield chunk({}, finish_reason)
+                    break
+                elif event_type in ("response.failed", "error"):
+                    message = json.dumps(event)[:600]
+                    yield f"data: {json.dumps({'error': {'message': message, 'type': 'proxy_error'}})}\n\n".encode()
+                    break
+        yield b"data: [DONE]\n\n"
+    except _ResponsesError as exc:
+        yield f"data: {json.dumps({'error': {'message': exc.message, 'type': 'proxy_error'}})}\n\n".encode()
+    except Exception as exc:
+        yield f"data: {json.dumps({'error': {'message': str(exc), 'type': 'proxy_error'}})}\n\n".encode()
 
 
 _STOP_REASONS = {
@@ -720,6 +1049,34 @@ async def chat_completions(request: Request):
             status_code=400,
             content={"error": {"type": "invalid_request_error", "message": "request body must be JSON"}},
         )
+
+    try:
+        api_key = _resolve_api_key(request)
+    except Exception as exc:
+        return JSONResponse(
+            status_code=401,
+            content={"error": {"type": "authentication_error", "message": str(exc)}},
+        )
+
+    use_responses = RESPONSES_MODE == "always" or (RESPONSES_MODE != "off" and _needs_responses(body))
+    if use_responses:
+        payload = _openai_to_responses(body)
+        if body.get("stream", False):
+            payload["stream"] = True
+            return StreamingResponse(
+                _responses_stream(payload, api_key, payload.get("model", "")),
+                media_type="text/event-stream",
+                headers={"cache-control": "no-cache", "x-accel-buffering": "no"},
+            )
+        try:
+            data = await asyncio.get_running_loop().run_in_executor(_CALL_EXECUTOR, _responses_call, payload, api_key)
+            return JSONResponse(content=_responses_to_openai(data))
+        except _ResponsesError as exc:
+            if not (RESPONSES_MODE == "auto" and exc.fallback):
+                return JSONResponse(
+                    status_code=exc.status,
+                    content={"error": {"message": exc.message, "type": "upstream_error"}},
+                )
 
     kw = _openai_to_anthropic(body)
 
