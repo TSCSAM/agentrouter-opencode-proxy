@@ -129,6 +129,152 @@ def _kwargs(body: dict) -> dict:
     return {k: v for k, v in body.items() if k not in _SKIP and k not in _STRIP}
 
 
+def _image_part(part: dict) -> dict | None:
+    """Convert an OpenAI image_url part into an Anthropic image block."""
+    image = part.get("image_url")
+    url = image.get("url", "") if isinstance(image, dict) else (image or "")
+    if not url:
+        return None
+    if url.startswith("data:"):
+        header, _, data = url.partition(",")
+        media_type = header[5:].split(";")[0] or "image/png"
+        return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}}
+    return {"type": "image", "source": {"type": "url", "url": url}}
+
+
+def _content_blocks(content) -> list:
+    """Convert OpenAI message content into Anthropic content blocks."""
+    if content is None:
+        return []
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}] if content else []
+    blocks = []
+    for part in content:
+        if isinstance(part, str):
+            blocks.append({"type": "text", "text": part})
+            continue
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type")
+        if ptype in ("text", "input_text"):
+            text = part.get("text", "")
+            if text:
+                blocks.append({"type": "text", "text": text})
+        elif ptype in ("image_url", "input_image"):
+            block = _image_part(part)
+            if block:
+                blocks.append(block)
+    return blocks
+
+
+def _tool_use_blocks(message: dict) -> list:
+    """Convert OpenAI assistant tool_calls into Anthropic tool_use blocks."""
+    blocks = []
+    for call in message.get("tool_calls") or []:
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function") or {}
+        name = fn.get("name")
+        if not name:
+            continue
+        raw = fn.get("arguments", "{}")
+        if isinstance(raw, str):
+            try:
+                arguments = json.loads(raw) if raw.strip() else {}
+            except json.JSONDecodeError:
+                arguments = {"value": raw}
+        elif isinstance(raw, dict):
+            arguments = raw
+        else:
+            arguments = {}
+        blocks.append({
+            "type": "tool_use",
+            "id": call.get("id") or f"toolu_{uuid.uuid4().hex[:16]}",
+            "name": name,
+            "input": arguments,
+        })
+    return blocks
+
+
+def _tool_result_block(message: dict) -> dict:
+    content = message.get("content")
+    if isinstance(content, list):
+        text = "\n".join(
+            part.get("text", "") for part in content
+            if isinstance(part, dict) and part.get("type") in ("text", "input_text")
+        )
+    else:
+        text = "" if content is None else str(content)
+    return {
+        "type": "tool_result",
+        "tool_use_id": message.get("tool_call_id", ""),
+        "content": text,
+    }
+
+
+def _is_tool_result_only(message: dict) -> bool:
+    content = message.get("content")
+    return (
+        message.get("role") == "user"
+        and isinstance(content, list)
+        and bool(content)
+        and all(isinstance(block, dict) and block.get("type") == "tool_result" for block in content)
+    )
+
+
+def _convert_tools(tools) -> list:
+    converted = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("type") not in (None, "function"):
+            continue
+        fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        name = fn.get("name")
+        if not name:
+            continue
+        item = {
+            "name": name,
+            "input_schema": fn.get("parameters") or {"type": "object", "properties": {}},
+        }
+        if fn.get("description"):
+            item["description"] = fn["description"]
+        converted.append(item)
+    return converted
+
+
+def _convert_tool_choice(choice) -> dict | None:
+    if isinstance(choice, str):
+        if choice == "auto":
+            return {"type": "auto"}
+        if choice in ("required", "any"):
+            return {"type": "any"}
+        return None
+    if isinstance(choice, dict):
+        ctype = choice.get("type")
+        if ctype == "function":
+            name = (choice.get("function") or {}).get("name")
+            if name:
+                return {"type": "tool", "name": name}
+        elif ctype in ("auto", "any"):
+            return {"type": ctype}
+    return None
+
+
+def _merge_roles(messages: list) -> list:
+    """Anthropic expects alternating turns; merge adjacent messages with the same role."""
+    merged = []
+    for message in messages:
+        if merged and merged[-1]["role"] == message["role"]:
+            previous = merged[-1]
+            prev_blocks = previous["content"] if isinstance(previous["content"], list) else _content_blocks(previous["content"])
+            new_blocks = message["content"] if isinstance(message["content"], list) else _content_blocks(message["content"])
+            previous["content"] = prev_blocks + new_blocks
+        else:
+            merged.append(dict(message))
+    return merged
+
+
 def _openai_to_anthropic(body: dict) -> dict:
     model = body.get("model", "claude-opus-4-6")
     # Strip optional group/provider prefix like "agentrouter/" or "new-provider/"
@@ -142,18 +288,37 @@ def _openai_to_anthropic(body: dict) -> dict:
 
     for msg in body.get("messages", []):
         role = msg.get("role", "user")
-        content = msg.get("content", "")
-        if role == "system":
+        content = msg.get("content")
+
+        if role in ("system", "developer"):
             if isinstance(content, str) and content:
                 system_parts.append(content)
             elif isinstance(content, list):
                 for part in content:
-                    if isinstance(part, dict) and part.get("type") == "text":
+                    if isinstance(part, dict) and part.get("type") in ("text", "input_text"):
                         system_parts.append(part.get("text", ""))
-        else:
-            if role not in ("user", "assistant"):
-                role = "user"
-            messages.append({"role": role, "content": content})
+            continue
+
+        if role == "tool":
+            block = _tool_result_block(msg)
+            if messages and _is_tool_result_only(messages[-1]):
+                messages[-1]["content"].append(block)
+            else:
+                messages.append({"role": "user", "content": [block]})
+            continue
+
+        if role == "assistant":
+            blocks = _content_blocks(content) + _tool_use_blocks(msg)
+            blocks = [b for b in blocks if not (b.get("type") == "text" and not b.get("text"))]
+            if blocks:
+                messages.append({"role": "assistant", "content": blocks})
+            continue
+
+        blocks = _content_blocks(content)
+        if blocks:
+            messages.append({"role": "user", "content": blocks})
+
+    messages = _merge_roles(messages)
 
     kw = {
         "model": model,
@@ -161,20 +326,63 @@ def _openai_to_anthropic(body: dict) -> dict:
         "messages": messages or [{"role": "user", "content": "hi"}],
     }
     if system_parts:
-        kw["system"] = "\n\n".join(system_parts)
+        kw["system"] = "\n\n".join(part for part in system_parts if part)
     if "temperature" in body:
         kw["temperature"] = body["temperature"]
     if "top_p" in body:
         kw["top_p"] = body["top_p"]
+    if body.get("stop"):
+        stop = body["stop"]
+        kw["stop_sequences"] = [stop] if isinstance(stop, str) else list(stop)
+
+    tools = [] if body.get("tool_choice") == "none" else _convert_tools(body.get("tools"))
+    if tools:
+        kw["tools"] = tools
+        choice = _convert_tool_choice(body.get("tool_choice"))
+        if choice:
+            kw["tool_choice"] = choice
+
+    if body.get("user"):
+        kw["metadata"] = {"user_id": str(body["user"])}
 
     return kw
 
 
+_STOP_REASONS = {
+    "end_turn": "stop",
+    "stop_sequence": "stop",
+    "max_tokens": "length",
+    "tool_use": "tool_calls",
+}
+
+
 def _anthropic_to_openai_response(msg: anthropic.types.Message) -> dict:
-    text_content = ""
+    texts = []
+    tool_calls = []
     for block in msg.content:
-        if getattr(block, "type", None) == "text":
-            text_content += getattr(block, "text", "")
+        block_type = getattr(block, "type", None)
+        if block_type == "text":
+            texts.append(getattr(block, "text", ""))
+        elif block_type == "tool_use":
+            tool_calls.append({
+                "id": block.id,
+                "type": "function",
+                "function": {
+                    "name": block.name,
+                    "arguments": json.dumps(block.input or {}, ensure_ascii=False),
+                },
+            })
+
+    finish_reason = _STOP_REASONS.get(msg.stop_reason, msg.stop_reason or "stop")
+    if tool_calls:
+        finish_reason = "tool_calls"
+
+    message = {
+        "role": "assistant",
+        "content": "".join(texts) or None,
+    }
+    if tool_calls:
+        message["tool_calls"] = tool_calls
 
     return {
         "id": f"chatcmpl-{msg.id}",
@@ -184,11 +392,8 @@ def _anthropic_to_openai_response(msg: anthropic.types.Message) -> dict:
         "choices": [
             {
                 "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": text_content,
-                },
-                "finish_reason": "stop" if msg.stop_reason == "end_turn" else msg.stop_reason,
+                "message": message,
+                "finish_reason": finish_reason,
             }
         ],
         "usage": {
@@ -299,44 +504,61 @@ async def _openai_stream_gen(client: anthropic.Anthropic, kw: dict):
     created = int(time.time())
     model = kw.get("model", "claude-opus-4-6")
 
-    role_chunk = {
-        "id": cmpl_id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-    }
-    yield f"data: {json.dumps(role_chunk)}\n\n".encode()
+    def _chunk(delta: dict, finish_reason=None) -> bytes:
+        payload = {
+            "id": cmpl_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+        return f"data: {json.dumps(payload)}\n\n".encode()
+
+    yield _chunk({"role": "assistant"})
 
     def _stream_call():
         return client.messages.create(**kw, stream=True)
+
+    tool_indices: dict[int, int] = {}
+    next_tool_index = 0
+    saw_tool = False
 
     try:
         stream = await asyncio.get_running_loop().run_in_executor(_CALL_EXECUTOR, _stream_call)
         for event in stream:
             event_type = getattr(event, "type", "")
-            if event_type == "content_block_delta":
-                delta_text = getattr(getattr(event, "delta", None), "text", "")
-                if delta_text:
-                    chunk = {
-                        "id": cmpl_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}],
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n".encode()
+            if event_type == "content_block_start":
+                block = getattr(event, "content_block", None)
+                if getattr(block, "type", "") == "tool_use":
+                    block_index = getattr(event, "index", -1)
+                    tool_indices[block_index] = next_tool_index
+                    saw_tool = True
+                    yield _chunk({"tool_calls": [{
+                        "index": next_tool_index,
+                        "id": block.id,
+                        "type": "function",
+                        "function": {"name": block.name, "arguments": ""},
+                    }]})
+                    next_tool_index += 1
+            elif event_type == "content_block_delta":
+                delta = getattr(event, "delta", None)
+                delta_type = getattr(delta, "type", "")
+                if delta_type == "text_delta":
+                    text = getattr(delta, "text", "")
+                    if text:
+                        yield _chunk({"content": text})
+                elif delta_type == "input_json_delta":
+                    partial = getattr(delta, "partial_json", "")
+                    tool_index = tool_indices.get(getattr(event, "index", -1))
+                    if partial and tool_index is not None:
+                        yield _chunk({"tool_calls": [{
+                            "index": tool_index,
+                            "function": {"arguments": partial},
+                        }]})
             elif event_type == "message_delta":
                 stop_reason = getattr(getattr(event, "delta", None), "stop_reason", None)
-                if stop_reason:
-                    chunk = {
-                        "id": cmpl_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop" if stop_reason == "end_turn" else stop_reason}],
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n".encode()
+                finish_reason = "tool_calls" if saw_tool else _STOP_REASONS.get(stop_reason, "stop")
+                yield _chunk({}, finish_reason)
         yield b"data: [DONE]\n\n"
     except Exception as exc:
         err_msg = json.dumps({"error": {"message": str(exc), "type": "proxy_error"}})

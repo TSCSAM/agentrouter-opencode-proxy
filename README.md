@@ -8,6 +8,8 @@
 Client  →  this proxy  →  agentrouter.org
 ```
 
+ترجمه کامل فراخوانی ابزار و پشتیبانی از تصویر در هر دو مسیر انجام می‌شود.
+
 ## راهنماها
 
 هر راهنما دو زبانه است؛ بخش فارسی و بخش انگلیسی.
@@ -64,6 +66,8 @@ A small **FastAPI** bridge between AI clients and **AgentRouter**. It speaks bot
 ```
 Client  →  this proxy  →  agentrouter.org
 ```
+
+Full tool-calling translation and image support on both routes.
 
 ## Guides
 
