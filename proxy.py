@@ -87,6 +87,48 @@ _CALL_EXECUTOR   = ThreadPoolExecutor(max_workers=CALL_WORKERS, thread_name_pref
 _STREAM_EXECUTOR = ThreadPoolExecutor(max_workers=STREAM_WORKERS, thread_name_prefix="ar-stream")
 
 
+def _log(event: str, **fields) -> None:
+    """Emit one JSON line to stdout so Railway logs stay greppable."""
+    record = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "event": event,
+    }
+    record.update(fields)
+    try:
+        print(json.dumps(record, ensure_ascii=False, default=str), flush=True)
+    except Exception:
+        pass
+
+
+def _tool_names(tools) -> list[str]:
+    """Tool names from either OpenAI (function.name) or Anthropic (name) shapes."""
+    names = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        name = function.get("name") if isinstance(function, dict) else tool.get("name")
+        if name:
+            names.append(str(name))
+    return names
+
+
+def _image_count(body: dict) -> int:
+    """Count image blocks in either OpenAI or Anthropic message shapes."""
+    count = 0
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, list):
+            count += sum(
+                1
+                for part in content
+                if isinstance(part, dict) and part.get("type") in ("image_url", "image", "input_image")
+            )
+    return count
+
+
 def _resolve_api_key(request: Request) -> str:
     """Return configured key or extract presented key from incoming request."""
     env_key = os.environ.get("AGENTROUTER_API_KEY", "").strip()
@@ -636,7 +678,7 @@ def _responses_call(payload: dict, api_key: str) -> dict:
         raise _ResponsesError(502, raw[:400]) from None
 
 
-def _responses_stream(payload: dict, api_key: str, model: str):
+def _responses_stream(payload: dict, api_key: str, model: str, request_id: str = ""):
     cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
 
@@ -695,12 +737,15 @@ def _responses_stream(payload: dict, api_key: str, model: str):
                     break
                 elif event_type in ("response.failed", "error"):
                     message = json.dumps(event)[:600]
+                    _log("stream_upstream_error", id=request_id, mode="responses", detail=message[:600])
                     yield f"data: {json.dumps({'error': {'message': message, 'type': 'proxy_error'}})}\n\n".encode()
                     break
         yield b"data: [DONE]\n\n"
     except _ResponsesError as exc:
+        _log("stream_upstream_error", id=request_id, mode="responses", status=exc.status, detail=exc.message[:600])
         yield f"data: {json.dumps({'error': {'message': exc.message, 'type': 'proxy_error'}})}\n\n".encode()
     except Exception as exc:
+        _log("stream_proxy_error", id=request_id, mode="responses", error=str(exc)[:600])
         yield f"data: {json.dumps({'error': {'message': str(exc), 'type': 'proxy_error'}})}\n\n".encode()
 
 
@@ -710,6 +755,348 @@ _STOP_REASONS = {
     "max_tokens": "length",
     "tool_use": "tool_calls",
 }
+
+
+# ── Anthropic Messages → Responses adapter ────────────────────────────────────
+#
+# Claude Code and OpenCode speak the Anthropic Messages API. AgentRouter refuses
+# function tools on that route for gpt-6.1-sol ("use /v1/responses"), so tool and
+# image requests are translated to the Responses API and back to Anthropic SSE.
+
+
+def _anthropic_system_text(system) -> str:
+    if isinstance(system, str):
+        return system
+    if isinstance(system, list):
+        parts = [
+            block.get("text", "")
+            for block in system
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
+        return "\n\n".join(part for part in parts if part)
+    return ""
+
+
+def _anthropic_blocks_to_responses(content, role: str) -> list:
+    if isinstance(content, str):
+        return [{"type": "output_text" if role == "assistant" else "input_text", "text": content}]
+    parts = []
+    for block in content or []:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "text":
+            text = block.get("text", "")
+            if text:
+                parts.append({"type": "output_text" if role == "assistant" else "input_text", "text": text})
+        elif block_type == "image":
+            source = block.get("source") or {}
+            if source.get("type") == "base64":
+                url = f"data:{source.get('media_type', 'image/png')};base64,{source.get('data', '')}"
+            elif source.get("type") == "url":
+                url = source.get("url", "")
+            else:
+                continue
+            if url:
+                parts.append({"type": "input_image", "image_url": url, "detail": "auto"})
+    return parts
+
+
+def _anthropic_tool_result_output(content) -> str:
+    if isinstance(content, str):
+        return content
+    parts = []
+    for block in content or []:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            parts.append(block.get("text", ""))
+        elif block.get("type") == "image":
+            parts.append("[image omitted]")
+    return "\n".join(part for part in parts if part)
+
+
+def _anthropic_to_responses(body: dict) -> dict:
+    model = body.get("model", "gpt-6.1-sol")
+    if "/" in model:
+        model = model.split("/", 1)[1]
+    max_tokens = body.get("max_tokens") or 4096
+    items = []
+
+    for message in body.get("messages") or []:
+        role = message.get("role")
+        content = message.get("content")
+
+        if role == "assistant":
+            blocks = _anthropic_blocks_to_responses(content, "assistant")
+            if blocks:
+                items.append({"role": "assistant", "content": blocks})
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        items.append({
+                            "type": "function_call",
+                            "call_id": block.get("id") or f"call_{uuid.uuid4().hex[:16]}",
+                            "name": block.get("name", ""),
+                            "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
+                        })
+            continue
+
+        if role in ("user", "system"):
+            if isinstance(content, list):
+                regular = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        items.append({
+                            "type": "function_call_output",
+                            "call_id": block.get("tool_use_id") or "",
+                            "output": _anthropic_tool_result_output(block.get("content")),
+                        })
+                    else:
+                        regular.append(block)
+                blocks = _anthropic_blocks_to_responses(regular, "user")
+            else:
+                blocks = _anthropic_blocks_to_responses(content, "user")
+            if blocks:
+                items.append({"role": "user", "content": blocks})
+
+    payload = {
+        "model": model,
+        "input": items or "hi",
+        "max_output_tokens": max_tokens,
+    }
+    system_text = _anthropic_system_text(body.get("system"))
+    if system_text:
+        payload["instructions"] = system_text
+    if "temperature" in body:
+        payload["temperature"] = body["temperature"]
+    if "top_p" in body:
+        payload["top_p"] = body["top_p"]
+
+    tools = []
+    for tool in body.get("tools") or []:
+        if not isinstance(tool, dict) or not tool.get("name"):
+            continue
+        tools.append({
+            "type": "function",
+            "name": tool["name"],
+            "description": tool.get("description", ""),
+            "parameters": tool.get("input_schema") or {"type": "object", "properties": {}},
+        })
+    if tools and body.get("tool_choice", {}).get("type") != "none":
+        payload["tools"] = tools
+        choice = body.get("tool_choice") or {}
+        if isinstance(choice, dict):
+            choice_type = choice.get("type")
+            if choice_type == "auto":
+                payload["tool_choice"] = "auto"
+            elif choice_type == "any":
+                payload["tool_choice"] = "required"
+            elif choice_type == "tool" and choice.get("name"):
+                payload["tool_choice"] = {"type": "function", "name": choice["name"]}
+
+    return payload
+
+
+def _responses_to_anthropic(data: dict) -> dict:
+    blocks = []
+    for item in data.get("output") or []:
+        item_type = item.get("type")
+        if item_type == "message":
+            for part in item.get("content") or []:
+                if part.get("type") in ("output_text", "text") and part.get("text"):
+                    blocks.append({"type": "text", "text": part["text"]})
+        elif item_type == "function_call":
+            try:
+                input_obj = json.loads(item.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                input_obj = {}
+            blocks.append({
+                "type": "tool_use",
+                "id": item.get("call_id") or item.get("id") or f"toolu_{uuid.uuid4().hex[:24]}",
+                "name": item.get("name", ""),
+                "input": input_obj,
+            })
+
+    has_tool = any(block["type"] == "tool_use" for block in blocks)
+    if has_tool:
+        stop_reason = "tool_use"
+    elif data.get("status") == "incomplete":
+        stop_reason = "max_tokens"
+    else:
+        stop_reason = "end_turn"
+
+    usage = data.get("usage") or {}
+    return {
+        "id": "msg_" + str(data.get("id") or uuid.uuid4().hex),
+        "type": "message",
+        "role": "assistant",
+        "model": data.get("model", ""),
+        "content": blocks,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": usage.get("input_tokens", 0),
+            "output_tokens": usage.get("output_tokens", 0),
+        },
+    }
+
+
+def _sse_event(event: str, data: dict) -> bytes:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode()
+
+
+async def _anthropic_stream_from_responses(payload: dict, api_key: str, request_id: str = ""):
+    message_id = "msg_" + uuid.uuid4().hex[:24]
+    model = payload.get("model", "")
+    yield _sse_event("message_start", {
+        "type": "message_start",
+        "message": {
+            "id": message_id,
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": [],
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        },
+    })
+
+    block_index = -1
+    open_block = None
+    tool_blocks: dict[int, int] = {}
+    saw_tool = False
+    finished = False
+
+    try:
+        with _responses_request(payload, api_key) as response:
+            for raw_line in response:
+                line = raw_line.decode("utf-8", "replace").strip()
+                if not line.startswith("data: "):
+                    continue
+                try:
+                    event = json.loads(line[6:])
+                except json.JSONDecodeError:
+                    continue
+                event_type = event.get("type")
+
+                if event_type == "response.output_item.added":
+                    item = event.get("item") or {}
+                    if item.get("type") == "message" and open_block is None:
+                        block_index += 1
+                        open_block = {"index": block_index, "type": "text"}
+                        yield _sse_event("content_block_start", {
+                            "type": "content_block_start",
+                            "index": block_index,
+                            "content_block": {"type": "text", "text": ""},
+                        })
+                    elif item.get("type") == "function_call":
+                        if open_block is not None:
+                            yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": open_block["index"]})
+                            open_block = None
+                        block_index += 1
+                        tool_blocks[event.get("output_index", 0)] = block_index
+                        saw_tool = True
+                        open_block = {"index": block_index, "type": "tool_use"}
+                        yield _sse_event("content_block_start", {
+                            "type": "content_block_start",
+                            "index": block_index,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": item.get("call_id") or item.get("id") or f"toolu_{uuid.uuid4().hex[:24]}",
+                                "name": item.get("name", ""),
+                                "input": {},
+                            },
+                        })
+
+                elif event_type == "response.output_text.delta":
+                    delta = event.get("delta", "")
+                    if delta:
+                        if open_block is None:
+                            block_index += 1
+                            open_block = {"index": block_index, "type": "text"}
+                            yield _sse_event("content_block_start", {
+                                "type": "content_block_start",
+                                "index": block_index,
+                                "content_block": {"type": "text", "text": ""},
+                            })
+                        yield _sse_event("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": open_block["index"],
+                            "delta": {"type": "text_delta", "text": delta},
+                        })
+
+                elif event_type == "response.function_call_arguments.delta":
+                    index = tool_blocks.get(event.get("output_index", 0))
+                    delta = event.get("delta", "")
+                    if index is not None and delta:
+                        yield _sse_event("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": index,
+                            "delta": {"type": "input_json_delta", "partial_json": delta},
+                        })
+
+                elif event_type == "response.output_item.done":
+                    item = event.get("item") or {}
+                    if open_block is not None and (
+                        (item.get("type") == "message" and open_block["type"] == "text")
+                        or (item.get("type") == "function_call" and open_block["type"] == "tool_use")
+                    ):
+                        yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": open_block["index"]})
+                        open_block = None
+
+                elif event_type in ("response.completed", "response.incomplete"):
+                    usage = (event.get("response") or {}).get("usage") or event.get("usage") or {}
+                    if open_block is not None:
+                        yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": open_block["index"]})
+                        open_block = None
+                    if event_type == "response.incomplete":
+                        stop_reason = "max_tokens"
+                    else:
+                        stop_reason = "tool_use" if saw_tool else "end_turn"
+                    yield _sse_event("message_delta", {
+                        "type": "message_delta",
+                        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                        "usage": {
+                            "input_tokens": usage.get("input_tokens", 0),
+                            "output_tokens": usage.get("output_tokens", 0),
+                        },
+                    })
+                    yield _sse_event("message_stop", {"type": "message_stop"})
+                    finished = True
+                    break
+
+                elif event_type in ("response.failed", "error"):
+                    _log("stream_upstream_error", id=request_id, mode="messages-responses", detail=json.dumps(event)[:600])
+                    yield _sse_event("error", {
+                        "type": "error",
+                        "error": {"type": "api_error", "message": json.dumps(event)[:600]},
+                    })
+                    finished = True
+                    break
+
+        if not finished:
+            if open_block is not None:
+                yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": open_block["index"]})
+            yield _sse_event("message_delta", {
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use" if saw_tool else "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": 0},
+            })
+            yield _sse_event("message_stop", {"type": "message_stop"})
+    except _ResponsesError as exc:
+        _log("stream_upstream_error", id=request_id, mode="messages-responses", status=exc.status, detail=exc.message[:600])
+        yield _sse_event("error", {
+            "type": "error",
+            "error": {"type": "api_error", "message": exc.message},
+        })
+    except Exception as exc:
+        _log("stream_proxy_error", id=request_id, mode="messages-responses", error=str(exc)[:600])
+        yield _sse_event("error", {
+            "type": "error",
+            "error": {"type": "api_error", "message": str(exc)},
+        })
 
 
 def _anthropic_to_openai_response(msg: anthropic.types.Message) -> dict:
@@ -855,7 +1242,7 @@ async def _stream_gen(q: asyncio.Queue, stop: threading.Event):
         yield payload
 
 
-async def _openai_stream_gen(client: anthropic.Anthropic, kw: dict):
+async def _openai_stream_gen(client: anthropic.Anthropic, kw: dict, request_id: str = ""):
     cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
     model = kw.get("model", "claude-opus-4-6")
@@ -917,6 +1304,7 @@ async def _openai_stream_gen(client: anthropic.Anthropic, kw: dict):
                 yield _chunk({}, finish_reason)
         yield b"data: [DONE]\n\n"
     except Exception as exc:
+        _log("stream_upstream_error", id=request_id, mode="messages", error=str(exc)[:600])
         err_msg = json.dumps({"error": {"message": str(exc), "type": "proxy_error"}})
         yield f"data: {err_msg}\n\n".encode()
 
@@ -956,11 +1344,55 @@ async def messages(request: Request):
 
     try:
         body = await request.json()
-    except Exception:
+    except Exception as exc:
+        _log("bad_request_body", path="/messages", error=str(exc)[:200])
         return JSONResponse(
             status_code=400,
             content={"error": {"type": "invalid_request_error", "message": "request body must be JSON"}},
         )
+
+    request_id = uuid.uuid4().hex[:8]
+    _log(
+        "messages_request",
+        id=request_id,
+        model=body.get("model"),
+        stream=bool(body.get("stream")),
+        messages=len(body.get("messages") or []),
+        tools=_tool_names(body.get("tools")),
+        images=_image_count(body),
+    )
+
+    use_responses = RESPONSES_MODE == "always" or (
+        RESPONSES_MODE != "off" and (bool(body.get("tools")) or _image_count(body) > 0)
+    )
+    if use_responses:
+        try:
+            api_key = _resolve_api_key(request)
+        except Exception as exc:
+            return JSONResponse(
+                status_code=401,
+                content={"type": "error", "error": {"type": "authentication_error", "message": str(exc)}},
+            )
+        payload = _anthropic_to_responses(body)
+        _log("messages_responses_route", id=request_id, model=payload.get("model"), tools=len(payload.get("tools") or []))
+        if body.get("stream", False):
+            payload["stream"] = True
+            return StreamingResponse(
+                _anthropic_stream_from_responses(payload, api_key, request_id),
+                media_type="text/event-stream",
+                headers={"cache-control": "no-cache", "x-accel-buffering": "no"},
+            )
+        try:
+            data = await asyncio.get_running_loop().run_in_executor(_CALL_EXECUTOR, _responses_call, payload, api_key)
+            return JSONResponse(content=_responses_to_anthropic(data))
+        except _ResponsesError as exc:
+            if not (RESPONSES_MODE == "auto" and exc.fallback):
+                _log("upstream_error", id=request_id, mode="messages-responses", status=exc.status, detail=exc.message[:700])
+                return JSONResponse(
+                    status_code=exc.status,
+                    content={"type": "error", "error": {"type": "api_error", "message": exc.message}},
+                )
+            _log("responses_fallback", id=request_id, status=exc.status, detail=exc.message[:300])
 
     kw = _kwargs(body)
 
@@ -991,11 +1423,13 @@ async def messages(request: Request):
             if kind == "error":
                 stop.set()
                 if isinstance(payload, anthropic.APIStatusError):
+                    _log("upstream_error", id=request_id, mode="messages", status=payload.status_code, detail=str(payload.body)[:700])
                     return Response(
                         content=json.dumps(payload.body) if payload.body else b"",
                         status_code=payload.status_code,
                         media_type="application/json",
                     )
+                _log("proxy_error", id=request_id, mode="messages", error=str(payload)[:700])
                 return JSONResponse(
                     status_code=502,
                     content={"error": {"type": "proxy_error", "message": str(payload)}},
@@ -1012,14 +1446,17 @@ async def messages(request: Request):
 
     try:
         msg = await asyncio.get_running_loop().run_in_executor(_CALL_EXECUTOR, _run)
+        _log("messages_done", id=request_id, stop_reason=getattr(msg, "stop_reason", None))
         return Response(content=msg.model_dump_json(), media_type="application/json")
     except anthropic.APIStatusError as e:
+        _log("upstream_error", id=request_id, mode="messages", status=e.status_code, detail=str(e.body)[:700])
         return Response(
             content=json.dumps(e.body) if e.body else b"",
             status_code=e.status_code,
             media_type="application/json",
         )
     except Exception as e:
+        _log("proxy_error", id=request_id, mode="messages", error=str(e)[:700])
         return Response(
             content=json.dumps({"error": {"message": str(e), "type": "proxy_error"}}),
             status_code=500,
@@ -1044,11 +1481,24 @@ async def chat_completions(request: Request):
 
     try:
         body = await request.json()
-    except Exception:
+    except Exception as exc:
+        _log("bad_request_body", path="/chat/completions", error=str(exc)[:200])
         return JSONResponse(
             status_code=400,
             content={"error": {"type": "invalid_request_error", "message": "request body must be JSON"}},
         )
+
+    request_id = uuid.uuid4().hex[:8]
+    tools = body.get("tools") or []
+    _log(
+        "chat_request",
+        id=request_id,
+        model=body.get("model"),
+        stream=bool(body.get("stream")),
+        messages=len(body.get("messages") or []),
+        tools=_tool_names(tools),
+        images=_image_count(body),
+    )
 
     try:
         api_key = _resolve_api_key(request)
@@ -1061,22 +1511,34 @@ async def chat_completions(request: Request):
     use_responses = RESPONSES_MODE == "always" or (RESPONSES_MODE != "off" and _needs_responses(body))
     if use_responses:
         payload = _openai_to_responses(body)
+        _log("responses_route", id=request_id, model=payload.get("model"), tools=len(payload.get("tools") or []))
         if body.get("stream", False):
             payload["stream"] = True
             return StreamingResponse(
-                _responses_stream(payload, api_key, payload.get("model", "")),
+                _responses_stream(payload, api_key, payload.get("model", ""), request_id),
                 media_type="text/event-stream",
                 headers={"cache-control": "no-cache", "x-accel-buffering": "no"},
             )
         try:
             data = await asyncio.get_running_loop().run_in_executor(_CALL_EXECUTOR, _responses_call, payload, api_key)
-            return JSONResponse(content=_responses_to_openai(data))
+            result = _responses_to_openai(data)
+            choice = (result.get("choices") or [{}])[0]
+            _log(
+                "chat_done",
+                id=request_id,
+                mode="responses",
+                finish=choice.get("finish_reason"),
+                tool_calls=len((choice.get("message") or {}).get("tool_calls") or []),
+            )
+            return JSONResponse(content=result)
         except _ResponsesError as exc:
             if not (RESPONSES_MODE == "auto" and exc.fallback):
+                _log("upstream_error", id=request_id, mode="responses", status=exc.status, detail=exc.message[:700])
                 return JSONResponse(
                     status_code=exc.status,
-                    content={"error": {"message": exc.message, "type": "upstream_error"}},
+                    content={"error": {"message": exc.message, "type": "upstream_error", "request_id": request_id}},
                 )
+            _log("responses_fallback", id=request_id, status=exc.status, detail=exc.message[:300])
 
     kw = _openai_to_anthropic(body)
 
@@ -1090,7 +1552,7 @@ async def chat_completions(request: Request):
 
     if body.get("stream", False):
         return StreamingResponse(
-            _openai_stream_gen(client, kw),
+            _openai_stream_gen(client, kw, request_id),
             media_type="text/event-stream",
             headers={"cache-control": "no-cache", "x-accel-buffering": "no"},
         )
@@ -1101,16 +1563,19 @@ async def chat_completions(request: Request):
     try:
         msg = await asyncio.get_running_loop().run_in_executor(_CALL_EXECUTOR, _run)
         openai_res = _anthropic_to_openai_response(msg)
+        _log("chat_done", id=request_id, mode="messages", finish=openai_res["choices"][0].get("finish_reason"))
         return JSONResponse(content=openai_res)
     except anthropic.APIStatusError as e:
+        _log("upstream_error", id=request_id, mode="messages", status=e.status_code, detail=str(e.body)[:700])
         return JSONResponse(
             status_code=e.status_code,
-            content={"error": {"message": str(e.body), "type": "upstream_error"}},
+            content={"error": {"message": str(e.body), "type": "upstream_error", "request_id": request_id}},
         )
     except Exception as e:
+        _log("proxy_error", id=request_id, mode="messages", error=str(e)[:700])
         return JSONResponse(
             status_code=500,
-            content={"error": {"message": str(e), "type": "proxy_error"}},
+            content={"error": {"message": str(e), "type": "proxy_error", "request_id": request_id}},
         )
 
 

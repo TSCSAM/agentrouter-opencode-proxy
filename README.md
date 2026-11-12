@@ -17,6 +17,7 @@ Client  →  this proxy  →  agentrouter.org
 - [راهنمای OpenCode](docs/opencode.md)
 - [راهنمای Claude Code](docs/claude-code.md)
 - [راهنمای AgentRouter](docs/agentrouter.md)
+- [ابزارها و مهارت‌ها](docs/tools-and-skills.md)
 
 ## شروع سریع روی Railway
 
@@ -76,6 +77,7 @@ Every guide is bilingual: Persian and English sections.
 - [OpenCode guide](docs/opencode.md)
 - [Claude Code guide](docs/claude-code.md)
 - [AgentRouter guide](docs/agentrouter.md)
+- [Tools and skills](docs/tools-and-skills.md)
 
 ## Quick start on Railway
 
