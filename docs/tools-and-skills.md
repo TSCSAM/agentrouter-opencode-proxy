@@ -88,6 +88,7 @@ python scripts/test_messages_adapter.py    # مسیر Anthropic، ابزار و 
 
 - پارامتر `stop` برای مدل `gpt-6.1-sol` در AgentRouter پشتیبانی نمی‌شود.
 - فقط مدل‌هایی که کلید شما در AgentRouter به آن‌ها دسترسی دارد کار می‌کنند.
+- اگر AgentRouter نرخ درخواست را محدود کند، پروکسی به‌جای تکرار پشت‌سرهم چند ثانیه صبر می‌کند و خطای قابل‌تلاش برمی‌گرداند.
 - اگر کلاینت ابزاری را در فهرست خود نداشته باشد، مدل هم نمی‌تواند آن را صدا بزند. پروکسی ابزار جدید نمی‌سازد؛ فقط ابزارهای کلاینت را منتقل می‌کند.
 
 ## امنیت
@@ -190,6 +191,7 @@ The last two need `PROXY_URL` and `AGENTROUTER_KEY`.
 
 - The `stop` parameter is not supported by `gpt-6.1-sol` on AgentRouter.
 - Only models your AgentRouter key is authorized for will work.
+- If AgentRouter rate-limits the proxy, it waits briefly and returns a retryable error instead of hammering the upstream.
 - If the client does not expose a tool, the model cannot call it. The proxy does not invent tools; it only carries the client's own tools.
 
 ## Security

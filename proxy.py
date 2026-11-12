@@ -75,6 +75,7 @@ CALL_WORKERS       = max(1, _env_int("PROXY_CALL_WORKERS", 16))
 STREAM_WORKERS     = max(1, _env_int("PROXY_STREAM_WORKERS", 32))
 STREAM_ERROR_STATUS = _env_bool("PROXY_STREAM_ERROR_STATUS", False)
 RESPONSES_MODE     = _env_str("PROXY_RESPONSES_MODE", "auto").lower()  # auto | always | off
+DEBUG_WAF          = _env_bool("PROXY_DEBUG_WAF", False)
 
 _TIMEOUT = anthropic.Timeout(
     connect=CONNECT_TIMEOUT,
@@ -157,7 +158,7 @@ def _get_client_for_request(request: Request) -> anthropic.Anthropic:
         "api_key": api_key,
         "base_url": TARGET,
         "timeout": _TIMEOUT,
-        "max_retries": 0,
+        "max_retries": 2,
     }
     if hasattr(anthropic, "DefaultHttpxClient"):
         kwargs["http_client"] = anthropic.DefaultHttpxClient(timeout=_TIMEOUT)
@@ -447,6 +448,28 @@ class _ResponsesError(Exception):
         self.fallback = fallback
 
 
+# Aliyun WAF answers bursts with an HTML challenge (HTTP 200). Fail fast for a
+# short window instead of hammering the upstream and extending the block.
+_WAF_LOCK = threading.Lock()
+_WAF_BLOCK_UNTIL = 0.0
+
+
+def _waf_cooldown_active() -> bool:
+    with _WAF_LOCK:
+        return time.time() < _WAF_BLOCK_UNTIL
+
+
+def _mark_waf_challenge(seconds: float = 20.0) -> None:
+    global _WAF_BLOCK_UNTIL
+    with _WAF_LOCK:
+        _WAF_BLOCK_UNTIL = max(_WAF_BLOCK_UNTIL, time.time() + seconds)
+
+
+def _looks_like_waf(body: str) -> bool:
+    head = body[:2000].lower()
+    return "aliyun_waf" in head or "<!doctype html" in head or "<html" in head
+
+
 def _responses_text(content) -> str:
     if content is None:
         return ""
@@ -682,12 +705,33 @@ def _responses_request(payload: dict, api_key: str):
 
 
 def _responses_call(payload: dict, api_key: str) -> dict:
-    with _responses_request(payload, api_key) as response:
-        raw = response.read().decode("utf-8", "replace")
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        raise _ResponsesError(502, raw[:400]) from None
+    last_error = _ResponsesError(502, "upstream request failed")
+    for attempt in range(3):
+        if _waf_cooldown_active():
+            raise _ResponsesError(503, "upstream is rate-limiting this proxy; retry in a few seconds")
+        try:
+            with _responses_request(payload, api_key) as response:
+                raw = response.read().decode("utf-8", "replace")
+            if _looks_like_waf(raw):
+                _mark_waf_challenge()
+                raise _ResponsesError(503, "upstream WAF challenge (rate limit); retry after a short pause")
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                raise _ResponsesError(502, raw[:400]) from None
+        except _ResponsesError as exc:
+            last_error = exc
+            if exc.status in (429, 500, 502, 503, 504) and attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            raise
+        except Exception as exc:
+            last_error = _ResponsesError(502, str(exc))
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            raise last_error
+    raise last_error
 
 
 def _responses_stream(payload: dict, api_key: str, model: str, request_id: str = ""):
@@ -715,6 +759,9 @@ def _responses_stream(payload: dict, api_key: str, model: str, request_id: str =
             for raw_line in response:
                 line = raw_line.decode("utf-8", "replace").strip()
                 if not line.startswith("data: "):
+                    if _looks_like_waf(line):
+                        _mark_waf_challenge()
+                        raise _ResponsesError(503, "upstream WAF challenge (rate limit); retry after a short pause")
                     continue
                 try:
                     event = json.loads(line[6:])
@@ -1001,6 +1048,9 @@ async def _anthropic_stream_from_responses(payload: dict, api_key: str, request_
             for raw_line in response:
                 line = raw_line.decode("utf-8", "replace").strip()
                 if not line.startswith("data: "):
+                    if _looks_like_waf(line):
+                        _mark_waf_challenge()
+                        raise _ResponsesError(503, "upstream WAF challenge (rate limit); retry after a short pause")
                     continue
                 try:
                     event = json.loads(line[6:])
@@ -1346,6 +1396,69 @@ async def health():
     return {"status": "ok"}
 
 
+_WAF_PROFILES = {
+    "anthropic-python": {
+        "User-Agent": "Anthropic/Python 0.49.0",
+        "x-stainless-lang": "python",
+        "x-stainless-package-version": "0.49.0",
+        "x-stainless-runtime": "CPython",
+    },
+    "claude-cli": {
+        "User-Agent": "claude-cli/2.0.0 (external, cli)",
+        "x-app": "cli",
+    },
+    "opencode": {
+        "User-Agent": "opencode/0.15.0",
+    },
+    "browser": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    },
+}
+
+
+def _waf_probe() -> dict:
+    results: dict = {}
+    try:
+        with urllib.request.urlopen("https://api.ipify.org", timeout=15) as response:
+            results["egress_ip"] = response.read().decode()
+    except Exception as exc:
+        results["egress_ip"] = f"error: {exc}"
+
+    for name, extra in _WAF_PROFILES.items():
+        request = urllib.request.Request(TARGET + "/v1/responses", data=b"{}", method="POST")
+        request.add_header("content-type", "application/json")
+        request.add_header("x-api-key", "invalid-probe-key")
+        request.add_header("anthropic-version", "2023-06-01")
+        for key, value in extra.items():
+            request.add_header(key, value)
+        try:
+            with _OPENER.open(request, timeout=20) as response:
+                body = response.read(140).decode("utf-8", "replace")
+                results[name] = {
+                    "status": response.status,
+                    "ctype": response.headers.get("content-type"),
+                    "body": body,
+                }
+        except urllib.error.HTTPError as exc:
+            body = exc.read(140).decode("utf-8", "replace")
+            results[name] = {
+                "status": exc.code,
+                "ctype": exc.headers.get("content-type"),
+                "body": body,
+            }
+        except Exception as exc:
+            results[name] = {"error": str(exc)[:200]}
+    return results
+
+
+@app.get("/debug/waf")
+async def debug_waf():
+    if not DEBUG_WAF:
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_CALL_EXECUTOR, _waf_probe)
+
+
 @app.get("/v1/models")
 @app.get("/models")
 async def models():
@@ -1473,6 +1586,14 @@ async def messages(request: Request):
 
     try:
         msg = await asyncio.get_running_loop().run_in_executor(_CALL_EXECUTOR, _run)
+        if isinstance(msg, str) or not hasattr(msg, "model_dump_json"):
+            _mark_waf_challenge()
+            _log("waf_challenge", id=request_id, mode="messages")
+            return Response(
+                content=json.dumps({"type": "error", "error": {"type": "api_error", "message": "upstream returned an HTML challenge (rate limit); retry later"}}),
+                status_code=502,
+                media_type="application/json",
+            )
         _log("messages_done", id=request_id, stop_reason=getattr(msg, "stop_reason", None))
         return Response(content=msg.model_dump_json(), media_type="application/json")
     except anthropic.APIStatusError as e:
@@ -1589,6 +1710,13 @@ async def chat_completions(request: Request):
 
     try:
         msg = await asyncio.get_running_loop().run_in_executor(_CALL_EXECUTOR, _run)
+        if isinstance(msg, str) or not hasattr(msg, "content"):
+            _mark_waf_challenge()
+            _log("waf_challenge", id=request_id, mode="chat")
+            return JSONResponse(
+                status_code=502,
+                content={"error": {"message": "upstream returned an HTML challenge (rate limit); retry later", "type": "upstream_error", "request_id": request_id}},
+            )
         openai_res = _anthropic_to_openai_response(msg)
         _log("chat_done", id=request_id, mode="messages", finish=openai_res["choices"][0].get("finish_reason"))
         return JSONResponse(content=openai_res)
