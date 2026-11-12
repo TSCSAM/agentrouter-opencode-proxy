@@ -75,10 +75,12 @@ PROXY_RESPONSES_MODE=auto
 سه اسکریپت در مخزن هست:
 
 ```
-python scripts/test_tool_catalog.py       # سازگاری تعریف ابزارها در مسیر Anthropic
-python scripts/test_full_catalog.py       # ۱۹ ابزار و مهارت در هر دو مسیر
-python scripts/test_bridge.py             # ترجمه پاسخ و استریم با سرور ساختگی
+python scripts/test_full_catalog.py        # ۱۹ ابزار و مهارت در هر دو مسیر
+python scripts/test_tool_result_vision.py  # تصویر داخل نتیجه ابزار
+python scripts/test_messages_adapter.py    # مسیر Anthropic، ابزار و استریم
 ```
+
+برای دو مورد آخر متغیرهای `PROXY_URL` و `AGENTROUTER_KEY` لازم است.
 
 `test_full_catalog.py` بررسی می‌کند که نام، توضیح و کل طرح‌واره هر ابزار بایت‌به‌بایت سالم عبور کند. کاتالوگ شامل پوسته، فایل، جست‌وجو، وب، فهرست کار، زیرعامل، مهارت، کنترل برنامه ویندوز، اسکرین‌شات، کلیپ‌بورد و کنترل دسکتاپ است.
 
@@ -175,10 +177,12 @@ The default is `auto`.
 Three scripts ship with the repository:
 
 ```
-python scripts/test_tool_catalog.py       # Anthropic-path schema integrity
-python scripts/test_full_catalog.py       # 19 tools and skills across both routes
-python scripts/test_bridge.py             # response and stream translation against a mock upstream
+python scripts/test_full_catalog.py        # 19 tools and skills across both routes
+python scripts/test_tool_result_vision.py  # image inside a tool result
+python scripts/test_messages_adapter.py    # Anthropic route, tools and streaming
 ```
+
+The last two need `PROXY_URL` and `AGENTROUTER_KEY`.
 
 `test_full_catalog.py` checks that each tool's name, description and JSON schema survive byte-identically. The catalog covers shell, files, search, web, todos, subagents, skills, Windows app launch, screenshots, clipboard and desktop control.
 

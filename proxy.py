@@ -482,6 +482,18 @@ def _responses_content(content) -> list:
     return parts
 
 
+def _responses_tool_output(content):
+    """Tool output stays plain text unless it carries images (screenshots)."""
+    if isinstance(content, str):
+        return content
+    parts = _responses_content(content)
+    if not parts:
+        return _responses_text(content)
+    if all(part.get("type") == "input_text" for part in parts):
+        return "\n".join(part.get("text", "") for part in parts)
+    return parts
+
+
 def _convert_responses_tools(tools) -> list:
     converted = []
     for tool in tools or []:
@@ -556,7 +568,7 @@ def _openai_to_responses(body: dict) -> dict:
             items.append({
                 "type": "function_call_output",
                 "call_id": message.get("tool_call_id") or message.get("name") or "",
-                "output": _responses_text(content),
+                "output": _responses_tool_output(content),
             })
             continue
 
@@ -802,18 +814,33 @@ def _anthropic_blocks_to_responses(content, role: str) -> list:
     return parts
 
 
-def _anthropic_tool_result_output(content) -> str:
+def _anthropic_tool_result_output(content):
     if isinstance(content, str):
         return content
     parts = []
     for block in content or []:
         if not isinstance(block, dict):
             continue
-        if block.get("type") == "text":
-            parts.append(block.get("text", ""))
-        elif block.get("type") == "image":
-            parts.append("[image omitted]")
-    return "\n".join(part for part in parts if part)
+        block_type = block.get("type")
+        if block_type == "text":
+            text = block.get("text", "")
+            if text:
+                parts.append({"type": "input_text", "text": text})
+        elif block_type == "image":
+            source = block.get("source") or {}
+            if source.get("type") == "base64":
+                url = f"data:{source.get('media_type', 'image/png')};base64,{source.get('data', '')}"
+            elif source.get("type") == "url":
+                url = source.get("url", "")
+            else:
+                continue
+            if url:
+                parts.append({"type": "input_image", "image_url": url, "detail": "auto"})
+    if not parts:
+        return ""
+    if all(part.get("type") == "input_text" for part in parts):
+        return "\n".join(part.get("text", "") for part in parts)
+    return parts
 
 
 def _anthropic_to_responses(body: dict) -> dict:
